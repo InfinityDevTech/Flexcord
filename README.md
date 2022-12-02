@@ -5,8 +5,6 @@
 
 - How do I use it?
   - As of right now its under development, so it doesnt exactly work. But look on the tauri [docs](https://tauri.app/v1/app/cli) for more info on how to use it.
-
-## About tauri
 <br/>
 
 ### Privacy First
