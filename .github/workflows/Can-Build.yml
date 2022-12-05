@@ -1,4 +1,4 @@
-name: 'Can-Build'
+name: 'Can Build'
 on: [pull_request]
 
 jobs:
