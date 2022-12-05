@@ -1,6 +1,6 @@
-name: 'My Workflow'
+name: 'Build'
 
-on: [pull_request, push]
+on: [push]
 
 jobs:
   create-release:
