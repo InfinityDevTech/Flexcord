@@ -29,9 +29,18 @@ fn greet(name: &str) -> String {
 }
 
 fn main() {
+
+    thread::Builder::new()
+        .name("Discord Connection".to_string())
+        .spawn(move || {
+            let rt = tokio::runtime::Runtime::new().unwrap();
+            rt.block_on(discord::start_client());
+        })
+        .unwrap();
+
         tauri::Builder::default()
     // This is where you pass in your commands
-    .invoke_handler(tauri::generate_handler![greet])
+    .invoke_handler(tauri::generate_handler![greet, discord::getGuildById])
     .run(tauri::generate_context!())
     .expect("failed to run app");
 }

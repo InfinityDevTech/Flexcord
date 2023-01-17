@@ -1,0 +1,5 @@
+.App {
+  background: var(--background-main);
+  height: 100vh;
+  overflow-y: hidden;
+}
