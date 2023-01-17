@@ -1,159 +1,171 @@
-extern crate chrono;
-extern crate json;
+mod consts;
 
-use crossbeam_channel::{unbounded, Receiver, Sender};
-use futures_util::stream::SplitSink;
-use futures_util::{SinkExt, StreamExt};
-use json::{parse, JsonValue, JsonError};
-use reqwest::header::{HeaderMap, HeaderValue};
-use std::thread::{self, sleep};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::{thread::sleep, time};
+
+use consts::Status;
+
+use serde_json::{json, Value};
+
+use consts::OpCode;
+use crossbeam_channel::{unbounded, Receiver};
+use futures_util::{stream::SplitSink, SinkExt, StreamExt};
 use tokio::net::TcpStream;
-use tokio_tungstenite::tungstenite::Message;
-use reqwest::{get, Client, Url};
-use tokio_tungstenite::{connect_async, MaybeTlsStream, WebSocketStream};
+use tokio_tungstenite::{
+    connect_async,
+    tungstenite::{stream::MaybeTlsStream, Message},
+    WebSocketStream,
+};
 
-// This is called in a new thread.
-pub async fn start_client() {
-    let (socket, _) = connect_async("wss://gateway.discord.gg/?v=10&encoding=json")
-        .await
-        .expect("Unable to connect!");
-    let (mut write, read) = socket.split();
-    let identfy = json::parse(r#"{"op":2,"d":{"token":"---","properties":{"$os":"windows","$browser":"Discord","$device":"Flexcord"},"large_threshold":{"isLosslessNumber":true,"value":"250"},"compress":false,"v":10}}"#).expect("Unable to parse identify payload!");
-    write
-        .send(Message::Text(json::stringify(identfy).into()))
-        .await
-        .unwrap();
-    let (c, x): (Sender<JsonValue>, Receiver<JsonValue>) = unbounded();
-    let (send_message, to_send): (Sender<JsonValue>, Receiver<JsonValue>) = unbounded();
-    thread::Builder::new()
-        .name("Socket Reader".to_string())
-        .spawn(|| {
-            let c = c;
-            let rt = tokio::runtime::Runtime::new().unwrap();
-            let d = read.for_each(|message| async {
-                let data: Vec<u8> = message.unwrap().into_data();
-                let _ = &c.send(parse(std::str::from_utf8(&data).unwrap()).unwrap())
-                    .unwrap();
-                let msg = parse(std::str::from_utf8(&data).unwrap()).unwrap();
-                if msg["t"] == "READY" {
-                    println!("Logged in as {}", msg["d"]["user"]["username"]);
-                    println!("Current email is {}", msg["d"]["user"]["email"]);
-                    println!("Flags {}", msg["d"]["user"]["flags"]);
-                }
-            });
-            rt.block_on(d);
-        }).expect("Unable to create heartbeat thred. Client would close anyways due to lack of heartbeat.");
-    let msg = x.recv().expect("Unwrap Err");
-    if msg["op"] == 10 {
-        let _ = write.send(Message::Text("{\"op\": 1, \"d\": null}".to_string()));
-        thread::Builder::new()
-        .name("Socket Heartbeat".to_string())
-        .spawn(move || {
-            let rt = tokio::runtime::Runtime::new().unwrap();
-            rt.block_on(
-                heartbeat(msg["d"]["heartbeat_interval"].as_u64().unwrap(), write, to_send));
-        }).expect("Unable to create heartbeat thred. Client would close anyways due to lack of heartbeat.");
-    } else {
-        panic!("Invalid OP code");
-    }
-    loop {
-        //println!("{}", x.recv().unwrap());
-        let mut message = x.recv().unwrap();
-        if message["t"] == "MESSAGE_CREATE" {
-            let guild = getGuild(message["d"]["guild_id"].as_str().unwrap()).await.unwrap();
-            println!("{} - {}#{}: {}", guild["name"], message["d"]["author"]["username"], message["d"]["author"]["discriminator"], message["d"]["content"]);
+/// 
+// A lot of this code was shamelessly stolen from (https://github.com/SpaceManiac/discord-rs)
+// Go show that repo some love as it works good
+///
+
+struct Timer {
+    next_tick_at: time::Instant,
+    tick_len: time::Duration,
+}
+
+impl Timer {
+    fn new(tick_len_ms: u64) -> Timer {
+        let tick_len = time::Duration::from_millis(tick_len_ms);
+        Timer {
+            next_tick_at: time::Instant::now() + tick_len,
+            tick_len: tick_len,
         }
-        message["d"] = json::parse("{}").unwrap();
-        println!("Sending {}", message);
-        send_message.send(message).expect("My bad");
+    }
+
+    #[allow(dead_code)]
+    fn immediately(&mut self) {
+        self.next_tick_at = time::Instant::now();
+    }
+
+    fn defer(&mut self) {
+        self.next_tick_at = time::Instant::now() + self.tick_len;
+    }
+
+    fn check_tick(&mut self) -> bool {
+        if time::Instant::now() >= self.next_tick_at {
+            self.next_tick_at = self.next_tick_at + self.tick_len;
+            true
+        } else {
+            false
+        }
+    }
+
+    fn sleep_until_tick(&mut self) {
+        let now = time::Instant::now();
+        if self.next_tick_at > now {
+            std::thread::sleep(self.next_tick_at - now);
+        }
+        self.next_tick_at = self.next_tick_at + self.tick_len;
     }
 }
 
-pub async fn heartbeat(
-    interval: u64,
-    mut writer: SplitSink<WebSocketStream<MaybeTlsStream<TcpStream>>, Message>,
-    tosend: Receiver<JsonValue>,
-) {
-    let mut lasttime = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap()
-        .as_millis();
-    let mut last_sequence: i64 = 0;
+pub struct ConnectionBuilder {
+    url: String,
+    token: String,
+}
 
-    'outer: loop {
-        sleep(Duration::from_millis(1));
+impl ConnectionBuilder {
+    pub fn new(url: String, token: String) -> ConnectionBuilder {
+        ConnectionBuilder { url, token }
+    }
 
-        loop {
-            match tosend.try_recv() {
-                Ok(msg) => {
-                    if msg["op"] == 1 {
-                        println!(
-                            "------- Setting sequence to  {}",
-                            msg["s"].as_i64().unwrap()
-                        );
-                        last_sequence = msg["s"].as_i64().unwrap();
-                        writer
-                            .send(Message::Text(format!(
-                                "{{\"op\": 1, \"d\": {}}}",
-                                last_sequence
-                            )))
-                            .await
-                            .unwrap();
-                    }
-                    if msg["s"].as_i64() >= Some(0) {
-                        println!(
-                            "------- Setting sequence to  {}",
-                            msg["s"].as_i64().unwrap()
-                        );
-                        last_sequence = msg["s"].as_i64().unwrap();
-                    }
-                }
-                Err(_) => break,
+    pub fn connect(&self) -> Result<(Connection, ReadyEvent)> {
+        let info = os_info::get();
+        let mut packet = json!({
+           "op": OpCode::Identify,
+           "d": {
+            "token": self.token,
+            "properties": {
+                "$os": info.os_type(),
+                "$browser": "Flexcord client",
+                "$device": "Flexcord client",
+            },
+            "large_threshold": 250,
+            "v": 10
+           }
+        });
+        Connection::_connect(&self.url, self.token.clone(), packet);
+    }
+}
+
+pub struct Connection {}
+
+impl Connection {
+    pub async fn _connect(
+        url: &str,
+        token: String,
+        packet: Value,
+    ) -> Result<(Connection, ReadyEvent)> {
+        let (ws, _) = connect_async(url).await.expect("Failure to connect = bad.");
+        let (mut send, mut receiver) = ws.split();
+
+        send.send(&packet);
+
+        let helloE;
+        match json::parse(receiver.next()) {
+            Ok(v) => helloE = v,
+            other => {
+                println!("Unexpected data in connection! - {:?}", other);
+                panic!("Unexpected data in connection! -{:?}", other);
             }
         }
 
-        if SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_millis()
-            - lasttime
-            >= interval as u128
-        {
-            println!(
-                "-------------------- SENDING HEARTBEAT -------------------- Sequence number: {}",
-                last_sequence
-            );
-            writer
-                .send(Message::Text(format!(
-                    "{{\"op\": 1, \"d\": {}}}",
-                    last_sequence
-                )))
-                .await
-                .unwrap();
-            lasttime = SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap()
-                .as_millis();
-        }
+        let (tx, rx) = unbounded();
+        std::thread::Builder::new()
+            .name("Discord sender".into())
+            .spawn(move || keepalive(helloE.clone(), send, rx));
+
+        let seq;
+        let ready;
     }
 }
 
+fn keepalive(
+    helloE: Value,
+    mut sender: SplitSink<WebSocketStream<MaybeTlsStream<TcpStream>>, Message>,
+    rx: Receiver<Value>,
+) {
+    let interval = helloE["d"]["heartbeat_interval"];
+    let mut timer = Timer::new(interval);
+    let mut last_s = 0;
 
-pub async fn getGuild(id: &str) -> Result<JsonValue, JsonError> {
-    let url = format!("https://discord.com/api/v8/guilds/{}", id);
-    let client = reqwest::Client::new();
-    let res = client
-        .get(&url)
-        .header("Authorization", "---");
-    let resp = res.send().await.unwrap();
-    let guild = json::parse(&resp.text().await.unwrap());
-    return guild
-}
+    'mLoop: loop {
+        sleep(time::Duration::from_millis(10));
 
-#[tauri::command]
-pub async fn getGuildById(id: String) -> String {
-println!("Done!");
-   let data = getGuild(&id).await.unwrap();
-   return json::stringify(data);
+        loop {
+            match rx.try_recv() {
+                Ok(Status::SendMessage(val)) => match sender.send(&val) {
+                      Ok(()) => {},
+                      Err(err) => println!("Error sending message {}", err),
+                },
+                Ok(Status::Sequence(seq)) => {
+                    last_s = seq;
+                },
+                Ok(Status::ChangeInterval(interval)) => {
+                    timer = Timer::new(interval);
+                },
+                Ok(Status::ChangeSender(new_sender)) => {
+                    sender = new_sender;
+                },
+                Ok(Status::Aborted) => break 'mLoop,
+                Err(crossbeam_channel::TryRecvError::Empty) => break,
+                Err(crossbeam_channel::TryRecvError::Disconnected) => break 'mLoop,
+            }
+        }
+
+        if timer.check_tick() {
+            let map = json!({
+                "op": 1,
+                "d": last_s,
+            });
+            match sender.send(&map) {
+                Ok(()) => {},
+                Err(err) => println!("Error sending heartbeat {}", err)
+            }
+        }
+    }
+    let _ = sender.get_mut().shutdown(std::net::Shutdown::Both);
 }

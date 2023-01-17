@@ -688,7 +688,6 @@ dependencies = [
  "crossbeam-channel",
  "futures-util",
  "json",
- "os_info",
  "reqwest",
  "serde",
  "serde_json",
