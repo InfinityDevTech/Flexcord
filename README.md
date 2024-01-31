@@ -1,3 +1,10 @@
+# Progress has been stopped
+Since I started testing FlexCord, Discord does not seem to like it.
+I recieved what was basically a cease and desist (But not actually)
+So, ya know, I dont want to get banned. So, no more updates!
+
+
+
 # Disclaimer
 Flexcord is ***NO WHERE*** near done.
 
